@@ -657,7 +657,17 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
-        """Warm up GDN prefill kernels during V1 profiling.
+        """Warm up GDN prefill kernels.
+
+        This method may be called twice during initialization:
+
+        1. Before memory profiling (via ``gdn_warmup_and_cleanup``):
+           triggers full autotuning (all configs benchmarked).  CUDA
+           modules are unloaded afterward by the caller so the overhead
+           does not reduce KV cache budget.
+        2. After KV cache allocation (via ``kernel_warmup``): the
+           autotuner cache has hits so only winning configs are compiled
+           — fast and lightweight.
 
         During V1 profile runs, ``_forward_core`` returns early because
         ``attn_metadata`` is ``None``, so the autotuned kernels used by
@@ -683,10 +693,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
         """
-        if hasattr(self, "_prefill_kernels_warmed_up"):
-            return
-        self._prefill_kernels_warmed_up = True
-
         device = mixed_qkv.device
         dtype = mixed_qkv.dtype
         num_k_heads = self.num_k_heads // self.tp_size
@@ -762,9 +768,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # V1 profile run — warm up prefill kernels so that
-            # autotuning completes before KV cache allocation.
-            self._warmup_prefill_kernels(mixed_qkv)
+            # V1 profile run — skip GDN kernels.  They are warmed up
+            # in determine_available_memory() before profiling, with
+            # CUDA modules unloaded afterward so the overhead does not
+            # reduce available KV cache memory.
             return
 
         assert isinstance(attn_metadata, dict)

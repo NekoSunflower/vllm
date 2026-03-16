@@ -6,6 +6,8 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import gc
+import sys
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,6 +37,11 @@ def kernel_warmup(worker: "Worker"):
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
+
+    # GDN (Gated Delta Net) Triton kernel warmup.
+    # Re-compiles only the winning configs (autotuner cache hit from
+    # the earlier gdn_warmup_and_cleanup call).
+    _gdn_warmup(worker)
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
@@ -76,6 +83,163 @@ def kernel_warmup(worker: "Worker"):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+
+def _gdn_warmup(worker: "Worker"):
+    """Warm up GDN (Gated Delta Net) Triton kernels.
+
+    The Triton autotuner cache is process-global, so warming up a single
+    GDN layer is sufficient — all layers share the same kernel configs.
+    """
+    model = worker.get_model()
+    for module in model.modules():
+        if hasattr(module, "_warmup_prefill_kernels"):
+            device = next(module.parameters()).device
+            dtype = next(module.parameters()).dtype
+            dummy = torch.empty(1, device=device, dtype=dtype)
+            module._warmup_prefill_kernels(dummy)
+            break
+
+
+def _unload_fla_triton_modules() -> int:
+    """Unload CUDA modules from Triton JIT caches for FLA ops.
+
+    After Triton autotuning, the JIT cache holds ``CompiledKernel``
+    objects for ALL benchmarked configs (~300 across FLA ops). Only the
+    winning config per autotune key is used going forward, but Triton
+    never calls ``cuModuleUnload`` — the modules persist for the
+    lifetime of the process.
+
+    This function walks every Triton ``Autotuner`` instance in the
+    imported FLA ops modules, accesses the wrapped ``JITFunction``'s
+    ``device_caches``, and calls ``cuModuleUnload`` on each compiled
+    kernel's CUDA module handle.  The ``Autotuner.cache`` (winning
+    ``Config`` per key) is **not** touched, so subsequent kernel calls
+    skip benchmarking and compile only the winning config.
+
+    Returns the number of CUDA modules successfully unloaded.
+    """
+    try:
+        import ctypes
+
+        from triton.runtime.autotuner import Autotuner
+        from triton.runtime.jit import JITFunction
+    except ImportError:
+        return 0
+
+    # Load the CUDA driver library for cuModuleUnload.
+    try:
+        libcuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        logger.debug("Could not load libcuda.so.1; skipping module unload.")
+        return 0
+
+    cu_module_unload = libcuda.cuModuleUnload
+    cu_module_unload.argtypes = [ctypes.c_void_p]
+    cu_module_unload.restype = ctypes.c_int  # CUresult; 0 = CUDA_SUCCESS
+
+    # Ensure all GPU work is complete before unloading modules.
+    current_platform.synchronize()
+
+    # Discover Autotuner instances from imported FLA ops modules.
+    # FLA kernels use two decorator patterns:
+    #   Heuristics(Autotuner(JITFunction))  — most kernels
+    #   Autotuner(JITFunction)              — e.g. l2norm
+    fla_prefix = "vllm.model_executor.layers.fla.ops"
+    autotuners: list[tuple[str, JITFunction]] = []
+
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None or not mod_name.startswith(fla_prefix):
+            continue
+        for attr_name in dir(mod):
+            obj = getattr(mod, attr_name, None)
+            if obj is None:
+                continue
+            # Walk the .fn chain to find Autotuner → JITFunction.
+            fn = obj
+            while fn is not None and not isinstance(fn, Autotuner):
+                fn = getattr(fn, "fn", None)
+            if not isinstance(fn, Autotuner):
+                continue
+            # fn is the Autotuner; fn.fn should be the JITFunction.
+            jit_fn = fn.fn
+            while jit_fn is not None and not isinstance(jit_fn, JITFunction):
+                jit_fn = getattr(jit_fn, "fn", None)
+            if isinstance(jit_fn, JITFunction):
+                autotuners.append((attr_name, jit_fn))
+
+    n_unloaded = 0
+    for name, jit_fn in autotuners:
+        if not hasattr(jit_fn, "device_caches"):
+            continue
+        for device_key in list(jit_fn.device_caches.keys()):
+            cache_tuple = jit_fn.device_caches[device_key]
+            if not isinstance(cache_tuple, (tuple, list)) or len(cache_tuple) < 2:
+                continue
+            kernel_cache = cache_tuple[0]
+            if not isinstance(kernel_cache, dict):
+                continue
+            for compiled_kernel in kernel_cache.values():
+                module_handle = getattr(compiled_kernel, "module", None)
+                if module_handle is not None and isinstance(module_handle, int):
+                    result = cu_module_unload(ctypes.c_void_p(module_handle))
+                    if result == 0:  # CUDA_SUCCESS
+                        n_unloaded += 1
+            kernel_cache.clear()
+            # Also clear the kernel_key_cache (second element).
+            kernel_key_cache = cache_tuple[1]
+            if isinstance(kernel_key_cache, dict):
+                kernel_key_cache.clear()
+
+    return n_unloaded
+
+
+def gdn_warmup_and_cleanup(worker: "Worker") -> None:
+    """Pre-profiling GDN warmup with CUDA module cleanup.
+
+    Runs GDN kernel warmup to populate Triton autotuner caches with
+    winning configs, then unloads all compiled CUDA modules to free
+    GPU memory (~1.5 GiB).  This ensures:
+
+    1. Autotuner results are cached (no re-benchmarking on next call).
+    2. CUDA module memory does not inflate ``non_torch_increase``
+       during memory profiling.
+    3. KV cache gets the maximum available memory budget.
+
+    On subsequent GDN kernel calls (e.g. in ``kernel_warmup()`` after
+    KV cache allocation), the autotuner finds cached winning configs
+    and compiles only those — loading ~1 CUDA module per kernel instead
+    of ~20.
+    """
+    model = worker.get_model()
+    if not any(hasattr(m, "_warmup_prefill_kernels") for m in model.modules()):
+        return
+
+    logger.info("Running GDN Triton kernel warmup before memory profiling.")
+
+    # FLA Triton kernels require a PyTorch-backed allocator for scratch
+    # memory.  Set it before warmup so autotuning can run.
+    from vllm.triton_utils.allocation import set_triton_allocator
+
+    set_triton_allocator(worker.device)
+    _gdn_warmup(worker)
+
+    try:
+        n_unloaded = _unload_fla_triton_modules()
+        if n_unloaded > 0:
+            logger.info(
+                "Unloaded %d Triton CUDA modules to free GPU memory for KV cache.",
+                n_unloaded,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to unload Triton CUDA modules. Memory profiling "
+            "may over-estimate non-KV-cache memory usage.",
+            exc_info=True,
+        )
+
+    gc.collect()
+    torch.accelerator.empty_cache()
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:

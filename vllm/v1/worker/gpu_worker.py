@@ -379,6 +379,18 @@ class Worker(WorkerBase):
             logger.info(msg)
             return kv_cache_memory_bytes
 
+        # Pre-profiling GDN warmup: run Triton autotuning while GPU memory
+        # is plentiful (before KV cache allocation), then unload the compiled
+        # CUDA modules so they don't inflate non_torch_increase during
+        # memory profiling.  The autotuner's in-memory cache (winning
+        # configs) is preserved; subsequent kernel calls compile only the
+        # winning config (~1 module per kernel instead of ~20).
+        from vllm.model_executor.warmup.kernel_warmup import (
+            gdn_warmup_and_cleanup,
+        )
+
+        gdn_warmup_and_cleanup(self)
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
