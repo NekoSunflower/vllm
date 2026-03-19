@@ -33,6 +33,7 @@ from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm._custom_ops as ops
+import vllm.utils.multi_stream_utils  # noqa: F401 (registers torch.ops.vllm.indexer_dual_stream)
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
@@ -625,6 +626,11 @@ class Indexer(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = config
+        self.events = (
+            [torch.cuda.Event(), torch.cuda.Event()]
+            if current_platform.is_cuda_alike()
+            else [None, None]
+        )
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
@@ -671,6 +677,11 @@ class Indexer(nn.Module):
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.prefix = prefix
+
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
@@ -685,24 +696,35 @@ class Indexer(nn.Module):
             self.topk_indices_buffer,
         )
 
+    def _compute_k(self, hidden_states: torch.Tensor):
+        k, _ = self.wk(hidden_states)
+        k = self.k_norm(k)
+        return k
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
+        # Overlap: weights_proj (default stream) || wk + k_norm (aux stream).
+        # Wrapped in a custom op to avoid graph breaks under torch.compile.
+        weights, k = torch.ops.vllm.indexer_dual_stream(
+            hidden_states,
+            self.prefix,
+            self.n_head,
+            self.head_dim,
+        )
+        k_pe, k_nope = torch.split(
+            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
 
-        k, _ = self.wk(hidden_states)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
-
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        # Note: RoPE (NeoX) can introduce extra leading dimensions during compilation
-        # so we need to reshape back to token-flattened shapes
+        # Note: RoPE (NeoX) can introduce extra leading dimensions during
+        # compilation so we need to reshape back to token-flattened shapes
         q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
         k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
@@ -723,7 +745,6 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
-        weights, _ = self.weights_proj(hidden_states)
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
@@ -1176,7 +1197,9 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer
+                vllm_config,
+                prefix,
+                topk_indices_buffer=topk_indices_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
